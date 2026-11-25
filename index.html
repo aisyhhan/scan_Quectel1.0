@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scan Quectel ke Sheets</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #111; color: #eee; }
+  header { padding: 10px 14px; font-weight: 600; background: #1b1b1b; }
+  video { width: 100%; max-height: 55vh; object-fit: cover; background: #000; }
+  #status { padding: 12px 14px; font-size: 18px; font-weight: 600; }
+  .ok { color: #6fdc8c; } .err { color: #ff7b7b; } .warn { color: #ffd166; }
+  #last { padding: 0 14px; font-family: monospace; font-size: 15px; line-height: 1.6; }
+  #log { padding: 8px 14px; font-size: 13px; color: #aaa; }
+  button { margin: 8px 14px; padding: 10px 16px; font-size: 15px; }
+</style>
+</head>
+<body>
+<header>Scan Quectel &rarr; Google Sheets</header>
+<video id="video" playsinline muted></video>
+<div id="status">Memulai kamera...</div>
+<div id="last"></div>
+<button id="reset">Reset scan</button>
+<div id="log"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script>
+// === GANTI dengan URL Web App dari Apps Script (berakhiran /exec) ===
+const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxzaEXKU3cYw5qjF-jAMeAUnbaIYbe-EyQ4x-DrAFFBeN9EWKLPSRPnwkeu8bogkAwBsA/exec";
+
+const video = document.getElementById("video");
+const statusEl = document.getElementById("status");
+const lastEl = document.getElementById("last");
+const logEl = document.getElementById("log");
+
+let pending = {};
+let busy = false;
+let lastText = "", lastTime = 0;
+
+function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ""; }
+function addLog(msg) { logEl.innerHTML = msg + "<br>" + logEl.innerHTML; }
+
+function parse(text) {
+  const d = {};
+  let m = text.match(/IMEI[:=\s]*(\d{15})/i) || text.match(/\b(\d{15})\b/);
+  if (m) d.imei = m[1];
+  m = text.match(/\bSN[:=\s]*([A-Z0-9]{8,})/i);
+  if (m) d.sn = m[1];
+  m = text.match(/\bID[\s_.-]*(?:NUMB|NUM|NO)?[:=\s]*([A-Z0-9]+)/i);
+  if (m) d.id = m[1];
+  return d;
+}
+
+async function handleText(text) {
+  const now = Date.now();
+  if (busy || (text === lastText && now - lastTime < 2500)) return;
+  lastText = text; lastTime = now;
+
+  Object.assign(pending, parse(text));
+  lastEl.textContent = `IMEI: ${pending.imei || "-"}\nSN: ${pending.sn || "-"}\nID: ${pending.id || "-"}`;
+  lastEl.style.whiteSpace = "pre";
+
+  if (!pending.imei || !pending.sn) {
+    setStatus("Belum lengkap, scan lagi...", "warn");
+    return;
+  }
+
+  busy = true;
+  setStatus("Mengirim ke Sheets...", "warn");
+  try {
+    const res = await fetch(SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" }, // hindari preflight CORS
+      body: JSON.stringify(pending),
+    });
+    const r = await res.json();
+    if (r.ok) {
+      setStatus(`OK #${r.no} tersimpan`, "ok");
+      addLog(`#${r.no} ${pending.imei} / ${pending.sn}`);
+      if (navigator.vibrate) navigator.vibrate(150);
+    } else if (r.duplicate) {
+      setStatus("DUPLIKAT: IMEI sudah ada", "err");
+    } else {
+      setStatus("Gagal: " + r.error, "err");
+    }
+  } catch (e) {
+    setStatus("Gagal kirim: " + e.message, "err");
+  }
+  pending = {};
+  setTimeout(() => { busy = false; }, 1500);
+}
+
+document.getElementById("reset").onclick = () => {
+  pending = {}; lastText = ""; busy = false;
+  lastEl.textContent = ""; setStatus("Arahkan kode 2D ke kamera");
+};
+
+async function start() {
+  if (SCRIPT_URL.startsWith("PASTE")) { setStatus("SCRIPT_URL belum diisi", "err"); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) {
+    setStatus("Kamera tidak bisa dibuka: " + e.message, "err");
+    return;
+  }
+  setStatus("Arahkan kode 2D ke kamera");
+
+  // Prioritas: BarcodeDetector bawaan Chrome Android (lebih bagus utk DataMatrix)
+  if ("BarcodeDetector" in window) {
+    try {
+      const formats = await BarcodeDetector.getSupportedFormats();
+      if (formats.includes("data_matrix")) {
+        const det = new BarcodeDetector({ formats: ["data_matrix", "qr_code", "code_128"] });
+        const loop = async () => {
+          try {
+            const codes = await det.detect(video);
+            if (codes.length) handleText(codes[0].rawValue);
+          } catch (e) {}
+          requestAnimationFrame(loop);
+        };
+        loop();
+        return;
+      }
+    } catch (e) {}
+  }
+
+  // Cadangan: ZXing
+  const Z = ZXing;
+  const hints = new Map();
+  hints.set(Z.DecodeHintType.POSSIBLE_FORMATS,
+    [Z.BarcodeFormat.DATA_MATRIX, Z.BarcodeFormat.QR_CODE, Z.BarcodeFormat.CODE_128]);
+  hints.set(Z.DecodeHintType.TRY_HARDER, true);
+  const reader = new Z.BrowserMultiFormatReader(hints, 300);
+  reader.decodeFromVideoElementContinuously
+    ? reader.decodeFromVideoElementContinuously(video, (result) => { if (result) handleText(result.getText()); })
+    : reader.decodeFromVideoElement(video, (result) => { if (result) handleText(result.getText()); });
+}
+start();
+</script>
+</body>
+</html>
